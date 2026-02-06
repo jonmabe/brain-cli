@@ -1,0 +1,22 @@
+{
+  "name": "brain-cli",
+  "version": "1.0.0",
+  "description": "CLI for interacting with Notion Brain System",
+  "main": "index.js",
+  "bin": {
+    "brain": "./bin/brain.js"
+  },
+  "scripts": {
+    "test": "node bin/brain.js --help"
+  },
+  "keywords": ["notion", "brain", "knowledge", "tasks", "cli"],
+  "author": "Marvin",
+  "license": "MIT",
+  "dependencies": {
+    "chalk": "^4.1.2",
+    "cli-table3": "^0.6.3",
+    "commander": "^11.1.0",
+    "ora": "^5.4.1",
+    "chrono-node": "^2.7.0"
+  }
+}
