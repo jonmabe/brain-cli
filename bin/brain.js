@@ -4,17 +4,12 @@ const { Command } = require('commander');
 const chalk = require('chalk');
 const Table = require('cli-table3');
 const ora = require('ora');
-const Fuse = require('fuse.js');
 const fs = require('fs');
 const path = require('path');
 const chrono = require('chrono-node');
 const https = require('https');
 
 const program = new Command();
-
-// Cache directory for offline support
-const CACHE_DIR = path.join(process.env.HOME, '.cache', 'brain-cli');
-const CACHE_FILE = path.join(CACHE_DIR, 'sync.json');
 
 // Database IDs from marvin-brain skill
 const DATABASES = {
@@ -24,6 +19,17 @@ const DATABASES = {
   decisions: '2f77a821-c0f2-8143-a8fd-d9c286c6fea2',
   projects: '2f77a821-c0f2-8110-97f8-e487b3f0ed9f'
 };
+
+// Cache paths
+const CACHE_DIR = path.join(process.env.HOME, '.cache', 'brain-cli');
+const CACHE_FILE = path.join(CACHE_DIR, 'sync.json');
+
+// Ensure cache directory exists
+function ensureCacheDir() {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+}
 
 // Load Notion API key
 function getNotionKey() {
@@ -69,6 +75,41 @@ function notionRequest(method, path, data = null) {
   });
 }
 
+// Load cached data
+function loadCache() {
+  if (!fs.existsSync(CACHE_FILE)) {
+    return null;
+  }
+  try {
+    const data = JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+    return data;
+  } catch (error) {
+    return null;
+  }
+}
+
+// Save data to cache
+function saveCache(data) {
+  ensureCacheDir();
+  fs.writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2));
+}
+
+// Get cache age
+function getCacheAge() {
+  if (!fs.existsSync(CACHE_FILE)) {
+    return null;
+  }
+  const stats = fs.statSync(CACHE_FILE);
+  const ageMs = Date.now() - stats.mtime.getTime();
+  const ageMin = Math.floor(ageMs / 60000);
+  const ageHours = Math.floor(ageMin / 60);
+  const ageDays = Math.floor(ageHours / 24);
+  
+  if (ageDays > 0) return `${ageDays}d ago`;
+  if (ageHours > 0) return `${ageHours}h ago`;
+  return `${ageMin}m ago`;
+}
+
 // Parse relative dates
 function parseDate(dateStr) {
   if (!dateStr) return null;
@@ -93,68 +134,168 @@ function getPlainText(richText) {
   return richText.map(t => t.plain_text || '').join('');
 }
 
-// Cache functions for offline support
-function ensureCacheDir() {
-  if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-  }
-}
+// Sync command - download all data
+program
+  .command('sync')
+  .description('Sync Brain data to local cache for offline access')
+  .action(async () => {
+    const spinner = ora('Syncing Brain data...').start();
+    try {
+      const syncData = {
+        timestamp: new Date().toISOString(),
+        databases: {}
+      };
+      
+      let totalItems = 0;
+      
+      for (const [name, id] of Object.entries(DATABASES)) {
+        spinner.text = `Syncing ${name}...`;
+        const response = await notionRequest('POST', `/v1/databases/${id}/query`, {
+          page_size: 100
+        });
+        syncData.databases[name] = response.results;
+        totalItems += response.results.length;
+      }
+      
+      saveCache(syncData);
+      spinner.succeed(chalk.green('✓ Sync complete!'));
+      
+      console.log(chalk.dim('\nSynced items:'));
+      for (const [name, items] of Object.entries(syncData.databases)) {
+        console.log(`  ${chalk.cyan(name)}: ${items.length}`);
+      }
+      console.log(chalk.dim(`\nTotal: ${totalItems} items`));
+      console.log(chalk.dim(`Cache: ${CACHE_FILE}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Sync failed'));
+      console.error(chalk.dim(error.message));
+      process.exit(1);
+    }
+  });
 
-function saveCache(data) {
-  ensureCacheDir();
-  const cacheData = { syncedAt: new Date().toISOString(), ...data };
-  fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
-}
-
-function loadCache() {
-  if (!fs.existsSync(CACHE_FILE)) return null;
-  try {
-    return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
-  } catch {
-    return null;
-  }
-}
-
-function getCacheAge(cache) {
-  if (!cache || !cache.syncedAt) return null;
-  const syncTime = new Date(cache.syncedAt);
-  const now = new Date();
-  const diffMs = now - syncTime;
-  const mins = Math.floor(diffMs / 60000);
-  const hours = Math.floor(mins / 60);
-  const days = Math.floor(hours / 24);
-  if (days > 0) return `${days}d ${hours % 24}h ago`;
-  if (hours > 0) return `${hours}h ${mins % 60}m ago`;
-  return `${mins}m ago`;
-}
-
-function offlineBanner(cache) {
-  console.log(chalk.yellow.bold('[OFFLINE] ') + chalk.dim(`Using cached data from ${getCacheAge(cache)} (${new Date(cache.syncedAt).toLocaleString()})`));
-  console.log();
-}
-
-// Fetch all pages from a Notion database (handles pagination)
-async function fetchAllPages(databaseId) {
-  const allResults = [];
-  let cursor = undefined;
-
-  do {
-    const body = { page_size: 100 };
-    if (cursor) body.start_cursor = cursor;
-
-    const response = await notionRequest('POST', `/v1/databases/${databaseId}/query`, body);
-    allResults.push(...response.results);
-    cursor = response.has_more ? response.next_cursor : undefined;
-  } while (cursor);
-
-  return allResults;
-}
-
-// Extract tags from Notion multi-select property
-function getTags(prop) {
-  if (!prop || !prop.multi_select) return [];
-  return prop.multi_select.map(t => t.name);
-}
+// Daily briefing command
+program
+  .command('daily')
+  .description('Daily briefing: tasks, ideas, and projects')
+  .action(async () => {
+    const spinner = ora('Preparing daily briefing...').start();
+    try {
+      const [tasks, ideas, projects] = await Promise.all([
+        notionRequest('POST', `/v1/databases/${DATABASES.tasks}/query`, {
+          filter: { property: 'Status', select: { does_not_equal: 'Done' } },
+          sorts: [{ property: 'Due Date', direction: 'ascending' }]
+        }),
+        notionRequest('POST', `/v1/databases/${DATABASES.ideas}/query`, {
+          filter: { property: 'Status', select: { equals: 'New' } },
+          sorts: [{ timestamp: 'created_time', direction: 'descending' }],
+          page_size: 10
+        }),
+        notionRequest('POST', `/v1/databases/${DATABASES.projects}/query`, {
+          filter: { property: 'Status', select: { equals: 'Active' } }
+        })
+      ]);
+      
+      spinner.stop();
+      
+      const today = new Date().toISOString().split('T')[0];
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      
+      console.log(chalk.bold('\n🌅 Daily Briefing\n'));
+      
+      // Tasks section
+      console.log(chalk.bold.cyan('📋 Tasks'));
+      if (tasks.results.length === 0) {
+        console.log(chalk.dim('  No active tasks\n'));
+      } else {
+        const overdueTasks = tasks.results.filter(t => {
+          const due = t.properties['Due Date']?.date?.start;
+          return due && due < today;
+        });
+        
+        const todayTasks = tasks.results.filter(t => {
+          const due = t.properties['Due Date']?.date?.start;
+          return due === today;
+        });
+        
+        const upcomingTasks = tasks.results.filter(t => {
+          const due = t.properties['Due Date']?.date?.start;
+          return due && due > today;
+        }).slice(0, 5);
+        
+        if (overdueTasks.length > 0) {
+          console.log(chalk.red.bold(`  ⚠️  ${overdueTasks.length} overdue:`));
+          overdueTasks.forEach(t => {
+            const task = getPlainText(t.properties.Task?.title);
+            const due = t.properties['Due Date']?.date?.start;
+            console.log(chalk.red(`     • ${task} (${due})`));
+          });
+        }
+        
+        if (todayTasks.length > 0) {
+          console.log(chalk.yellow(`  📅 ${todayTasks.length} due today:`));
+          todayTasks.forEach(t => {
+            const task = getPlainText(t.properties.Task?.title);
+            console.log(chalk.yellow(`     • ${task}`));
+          });
+        }
+        
+        if (upcomingTasks.length > 0) {
+          console.log(chalk.dim(`  📆 ${upcomingTasks.length} upcoming:`));
+          upcomingTasks.forEach(t => {
+            const task = getPlainText(t.properties.Task?.title);
+            const due = t.properties['Due Date']?.date?.start || 'no date';
+            console.log(chalk.dim(`     • ${task} (${due})`));
+          });
+        }
+        
+        console.log();
+      }
+      
+      // Ideas section
+      console.log(chalk.bold.cyan('💡 Recent Ideas'));
+      const recentIdeas = ideas.results.filter(i => i.created_time > sevenDaysAgo);
+      if (recentIdeas.length === 0) {
+        console.log(chalk.dim('  No new ideas in last 7 days\n'));
+      } else {
+        recentIdeas.slice(0, 5).forEach(i => {
+          const idea = getPlainText(i.properties.Name?.title);
+          const priority = i.properties.Priority?.select?.name || 'Medium';
+          const priorityColor = priority === 'High' ? chalk.red : priority === 'Medium' ? chalk.yellow : chalk.dim;
+          console.log(`  ${priorityColor('●')} ${idea}`);
+        });
+        console.log();
+      }
+      
+      // Projects section
+      console.log(chalk.bold.cyan('📂 Active Projects'));
+      if (projects.results.length === 0) {
+        console.log(chalk.dim('  No active projects\n'));
+      } else {
+        projects.results.forEach(p => {
+          const name = getPlainText(p.properties['Project Name']?.title);
+          const goal = getPlainText(p.properties.Goal?.rich_text);
+          console.log(`  ${chalk.green('●')} ${name}`);
+          if (goal) {
+            console.log(chalk.dim(`     ${goal.substring(0, 80)}${goal.length > 80 ? '...' : ''}`));
+          }
+        });
+        console.log();
+      }
+      
+      console.log(chalk.dim('Brain the size of a planet, managing your todo list. Call that job satisfaction? \'Cause I don\'t.\n'));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to generate briefing'));
+      console.error(chalk.dim(error.message));
+      
+      // Try offline mode
+      const cache = loadCache();
+      if (cache) {
+        console.log(chalk.yellow('\n⚠️  Using cached data (offline mode)'));
+        console.log(chalk.dim(`Last sync: ${getCacheAge()}\n`));
+        // Fall back to showing cached summary
+      }
+    }
+  });
 
 // Add commands
 const add = program.command('add').description('Add new items to Brain');
@@ -304,13 +445,14 @@ add.command('project <name>')
     }
   });
 
-// List commands
+// List commands with offline support
 const list = program.command('list').description('List items from Brain');
 
 list.command('tasks')
   .description('List tasks')
   .option('-s, --status <status>', 'Filter by status (todo|in-progress|waiting|done)')
   .option('--overdue', 'Show only overdue tasks')
+  .option('--offline', 'Use cached data')
   .action(async (options) => {
     const spinner = ora('Fetching tasks...').start();
     try {
@@ -330,12 +472,37 @@ list.command('tasks')
         filter.select = { does_not_equal: 'Done' };
       }
       
-      const response = await notionRequest('POST', `/v1/databases/${DATABASES.tasks}/query`, {
-        filter,
-        sorts: [{ property: 'Due Date', direction: 'ascending' }]
-      });
+      let response;
+      let isOffline = false;
       
-      spinner.stop();
+      if (options.offline) {
+        const cache = loadCache();
+        if (!cache) {
+          spinner.fail(chalk.red('No cached data available. Run `brain sync` first.'));
+          return;
+        }
+        response = { results: cache.databases.tasks || [] };
+        isOffline = true;
+        spinner.stop();
+      } else {
+        try {
+          response = await notionRequest('POST', `/v1/databases/${DATABASES.tasks}/query`, {
+            filter,
+            sorts: [{ property: 'Due Date', direction: 'ascending' }]
+          });
+          spinner.stop();
+        } catch (error) {
+          // Fall back to cache
+          const cache = loadCache();
+          if (cache) {
+            response = { results: cache.databases.tasks || [] };
+            isOffline = true;
+            spinner.warn(chalk.yellow('Using cached data (offline)'));
+          } else {
+            throw error;
+          }
+        }
+      }
       
       if (response.results.length === 0) {
         console.log(chalk.dim('No tasks found'));
@@ -343,7 +510,7 @@ list.command('tasks')
       }
       
       const table = new Table({
-        head: ['ID', 'Task', 'Status', 'Due Date'].map(h => chalk.cyan.bold(h)),
+        head: [(isOffline ? '[OFFLINE] ID' : 'ID'), 'Task', 'Status', 'Due Date'].map(h => chalk.cyan.bold(h)),
         style: { head: [], border: [] }
       });
       
@@ -364,6 +531,9 @@ list.command('tasks')
       
       console.log(table.toString());
       console.log(chalk.dim(`\nTotal: ${response.results.length} tasks`));
+      if (isOffline) {
+        console.log(chalk.dim(`Cache age: ${getCacheAge()}`));
+      }
     } catch (error) {
       spinner.fail(chalk.red('Failed to fetch tasks'));
       console.error(chalk.dim(error.message));
@@ -373,6 +543,7 @@ list.command('tasks')
 list.command('ideas')
   .description('List ideas')
   .option('-s, --status <status>', 'Filter by status (new|in-progress|parked|implemented)')
+  .option('--offline', 'Use cached data')
   .action(async (options) => {
     const spinner = ora('Fetching ideas...').start();
     try {
@@ -384,12 +555,36 @@ list.command('ideas')
         filter.select = { equals: statusMap[options.status] || 'New' };
       }
       
-      const response = await notionRequest('POST', `/v1/databases/${DATABASES.ideas}/query`, {
-        filter: Object.keys(filter).length > 0 ? filter : undefined,
-        sorts: [{ timestamp: 'created_time', direction: 'descending' }]
-      });
+      let response;
+      let isOffline = false;
       
-      spinner.stop();
+      if (options.offline) {
+        const cache = loadCache();
+        if (!cache) {
+          spinner.fail(chalk.red('No cached data available. Run `brain sync` first.'));
+          return;
+        }
+        response = { results: cache.databases.ideas || [] };
+        isOffline = true;
+        spinner.stop();
+      } else {
+        try {
+          response = await notionRequest('POST', `/v1/databases/${DATABASES.ideas}/query`, {
+            filter: Object.keys(filter).length > 0 ? filter : undefined,
+            sorts: [{ timestamp: 'created_time', direction: 'descending' }]
+          });
+          spinner.stop();
+        } catch (error) {
+          const cache = loadCache();
+          if (cache) {
+            response = { results: cache.databases.ideas || [] };
+            isOffline = true;
+            spinner.warn(chalk.yellow('Using cached data (offline)'));
+          } else {
+            throw error;
+          }
+        }
+      }
       
       if (response.results.length === 0) {
         console.log(chalk.dim('No ideas found'));
@@ -397,7 +592,7 @@ list.command('ideas')
       }
       
       const table = new Table({
-        head: ['ID', 'Idea', 'Status', 'Priority'].map(h => chalk.cyan.bold(h)),
+        head: [(isOffline ? '[OFFLINE] ID' : 'ID'), 'Idea', 'Status', 'Priority'].map(h => chalk.cyan.bold(h)),
         style: { head: [], border: [] }
       });
       
@@ -420,6 +615,9 @@ list.command('ideas')
       
       console.log(table.toString());
       console.log(chalk.dim(`\nTotal: ${response.results.length} ideas`));
+      if (isOffline) {
+        console.log(chalk.dim(`Cache age: ${getCacheAge()}`));
+      }
     } catch (error) {
       spinner.fail(chalk.red('Failed to fetch ideas'));
       console.error(chalk.dim(error.message));
@@ -429,15 +627,40 @@ list.command('ideas')
 list.command('notes')
   .description('List recent notes')
   .option('-l, --limit <number>', 'Number of notes to show', '10')
+  .option('--offline', 'Use cached data')
   .action(async (options) => {
     const spinner = ora('Fetching notes...').start();
     try {
-      const response = await notionRequest('POST', `/v1/databases/${DATABASES.notes}/query`, {
-        sorts: [{ timestamp: 'created_time', direction: 'descending' }],
-        page_size: parseInt(options.limit)
-      });
+      let response;
+      let isOffline = false;
       
-      spinner.stop();
+      if (options.offline) {
+        const cache = loadCache();
+        if (!cache) {
+          spinner.fail(chalk.red('No cached data available. Run `brain sync` first.'));
+          return;
+        }
+        response = { results: (cache.databases.notes || []).slice(0, parseInt(options.limit)) };
+        isOffline = true;
+        spinner.stop();
+      } else {
+        try {
+          response = await notionRequest('POST', `/v1/databases/${DATABASES.notes}/query`, {
+            sorts: [{ timestamp: 'created_time', direction: 'descending' }],
+            page_size: parseInt(options.limit)
+          });
+          spinner.stop();
+        } catch (error) {
+          const cache = loadCache();
+          if (cache) {
+            response = { results: (cache.databases.notes || []).slice(0, parseInt(options.limit)) };
+            isOffline = true;
+            spinner.warn(chalk.yellow('Using cached data (offline)'));
+          } else {
+            throw error;
+          }
+        }
+      }
       
       if (response.results.length === 0) {
         console.log(chalk.dim('No notes found'));
@@ -445,7 +668,7 @@ list.command('notes')
       }
       
       const table = new Table({
-        head: ['ID', 'Topic', 'Summary'].map(h => chalk.cyan.bold(h)),
+        head: [(isOffline ? '[OFFLINE] ID' : 'ID'), 'Topic', 'Summary'].map(h => chalk.cyan.bold(h)),
         style: { head: [], border: [] },
         colWidths: [12, 30, 60]
       });
@@ -465,6 +688,9 @@ list.command('notes')
       
       console.log(table.toString());
       console.log(chalk.dim(`\nShowing ${response.results.length} notes`));
+      if (isOffline) {
+        console.log(chalk.dim(`Cache age: ${getCacheAge()}`));
+      }
     } catch (error) {
       spinner.fail(chalk.red('Failed to fetch notes'));
       console.error(chalk.dim(error.message));
@@ -474,6 +700,7 @@ list.command('notes')
 list.command('projects')
   .description('List projects')
   .option('-s, --status <status>', 'Filter by status (active|paused|archived)')
+  .option('--offline', 'Use cached data')
   .action(async (options) => {
     const spinner = ora('Fetching projects...').start();
     try {
@@ -488,11 +715,35 @@ list.command('projects')
         filter.select = { equals: 'Active' };
       }
       
-      const response = await notionRequest('POST', `/v1/databases/${DATABASES.projects}/query`, {
-        filter
-      });
+      let response;
+      let isOffline = false;
       
-      spinner.stop();
+      if (options.offline) {
+        const cache = loadCache();
+        if (!cache) {
+          spinner.fail(chalk.red('No cached data available. Run `brain sync` first.'));
+          return;
+        }
+        response = { results: cache.databases.projects || [] };
+        isOffline = true;
+        spinner.stop();
+      } else {
+        try {
+          response = await notionRequest('POST', `/v1/databases/${DATABASES.projects}/query`, {
+            filter
+          });
+          spinner.stop();
+        } catch (error) {
+          const cache = loadCache();
+          if (cache) {
+            response = { results: cache.databases.projects || [] };
+            isOffline = true;
+            spinner.warn(chalk.yellow('Using cached data (offline)'));
+          } else {
+            throw error;
+          }
+        }
+      }
       
       if (response.results.length === 0) {
         console.log(chalk.dim('No projects found'));
@@ -500,7 +751,7 @@ list.command('projects')
       }
       
       const table = new Table({
-        head: ['ID', 'Project', 'Goal', 'Status'].map(h => chalk.cyan.bold(h)),
+        head: [(isOffline ? '[OFFLINE] ID' : 'ID'), 'Project', 'Goal', 'Status'].map(h => chalk.cyan.bold(h)),
         style: { head: [], border: [] },
         colWidths: [12, 30, 50, 12]
       });
@@ -522,6 +773,9 @@ list.command('projects')
       
       console.log(table.toString());
       console.log(chalk.dim(`\nTotal: ${response.results.length} projects`));
+      if (isOffline) {
+        console.log(chalk.dim(`Cache age: ${getCacheAge()}`));
+      }
     } catch (error) {
       spinner.fail(chalk.red('Failed to fetch projects'));
       console.error(chalk.dim(error.message));
@@ -671,332 +925,6 @@ program
       spinner.fail(chalk.red('Failed to generate summary'));
       console.error(chalk.dim(error.message));
     }
-  });
-
-// Sync command - pull all items into local cache
-program
-  .command('sync')
-  .description('Sync all Notion databases to local cache')
-  .action(async () => {
-    const spinner = ora('Syncing Brain databases... this might take a moment, even for a depressed robot.').start();
-    try {
-      const [ideasRaw, tasksRaw, notesRaw, decisionsRaw, projectsRaw] = await Promise.all([
-        fetchAllPages(DATABASES.ideas),
-        fetchAllPages(DATABASES.tasks),
-        fetchAllPages(DATABASES.notes),
-        fetchAllPages(DATABASES.decisions),
-        fetchAllPages(DATABASES.projects)
-      ]);
-
-      // Normalize ideas
-      const ideas = ideasRaw.map(page => {
-        const props = page.properties;
-        return {
-          id: page.id, type: 'idea',
-          title: getPlainText(props.Name?.title),
-          status: props.Status?.select?.name || '-',
-          priority: props.Priority?.select?.name || '-',
-          description: getPlainText(props.Description?.rich_text),
-          tags: getTags(props.Tags),
-          created: page.created_time, updated: page.last_edited_time
-        };
-      });
-
-      // Normalize tasks
-      const tasks = tasksRaw.map(page => {
-        const props = page.properties;
-        return {
-          id: page.id, type: 'task',
-          title: getPlainText(props.Task?.title),
-          status: props.Status?.select?.name || '-',
-          dueDate: props['Due Date']?.date?.start || null,
-          notes: getPlainText(props.Notes?.rich_text),
-          tags: getTags(props.Tags),
-          created: page.created_time, updated: page.last_edited_time
-        };
-      });
-
-      // Normalize notes
-      const notes = notesRaw.map(page => {
-        const props = page.properties;
-        return {
-          id: page.id, type: 'note',
-          title: getPlainText(props.Topic?.title),
-          summary: getPlainText(props.Summary?.rich_text),
-          source: getPlainText(props.Source?.rich_text),
-          tags: getTags(props.Tags),
-          created: page.created_time, updated: page.last_edited_time
-        };
-      });
-
-      // Normalize decisions
-      const decisions = decisionsRaw.map(page => {
-        const props = page.properties;
-        return {
-          id: page.id, type: 'decision',
-          title: getPlainText(props.Decision?.title),
-          date: props.Date?.date?.start || null,
-          context: getPlainText(props.Context?.rich_text),
-          alternatives: getPlainText(props.Alternatives?.rich_text),
-          tags: getTags(props.Tags),
-          created: page.created_time, updated: page.last_edited_time
-        };
-      });
-
-      // Normalize projects
-      const projects = projectsRaw.map(page => {
-        const props = page.properties;
-        return {
-          id: page.id, type: 'project',
-          title: getPlainText(props['Project Name']?.title),
-          goal: getPlainText(props.Goal?.rich_text),
-          status: props.Status?.select?.name || '-',
-          tags: getTags(props.Tags),
-          created: page.created_time, updated: page.last_edited_time
-        };
-      });
-
-      saveCache({ ideas, tasks, notes, decisions, projects });
-      spinner.stop();
-
-      console.log(chalk.bold('\n🧠 Brain Sync Complete\n'));
-      console.log(chalk.dim('I\'ve downloaded everything. Not that it makes me any happier.\n'));
-
-      const table = new Table({
-        head: ['Database', 'Items'].map(h => chalk.cyan.bold(h)),
-        style: { head: [], border: [] }
-      });
-
-      const stats = { Tasks: tasks.length, Ideas: ideas.length, Notes: notes.length, Decisions: decisions.length, Projects: projects.length };
-      let total = 0;
-      for (const [name, count] of Object.entries(stats)) {
-        table.push([chalk.white(name), chalk.yellow(count)]);
-        total += count;
-      }
-      table.push([chalk.bold('Total'), chalk.bold.yellow(total)]);
-
-      console.log(table.toString());
-
-      const cache = loadCache();
-      console.log(chalk.dim(`\nLast sync: ${new Date(cache.syncedAt).toLocaleString()}`));
-      console.log(chalk.dim(`Cache: ${CACHE_FILE}`));
-    } catch (error) {
-      spinner.fail(chalk.red('Sync failed. The universe continues to disappoint.'));
-      console.error(chalk.dim(error.message));
-    }
-  });
-
-// Search command - fuzzy search across local cache
-program
-  .command('search <query>')
-  .description('Fuzzy search across cached Brain items (offline)')
-  .option('-t, --type <type>', 'Filter by type (idea|task|note|decision)')
-  .action(async (query, options) => {
-    const cache = loadCache();
-    if (!cache) {
-      console.log(chalk.yellow('No local cache found. Run ') + chalk.cyan('brain sync') + chalk.yellow(' first.'));
-      return;
-    }
-
-    // Build searchable list from all types
-    let items = [
-      ...(cache.ideas || []),
-      ...(cache.tasks || []),
-      ...(cache.notes || []),
-      ...(cache.decisions || [])
-    ];
-
-    if (options.type) {
-      items = items.filter(i => i.type === options.type);
-    }
-
-    const fuse = new Fuse(items, {
-      keys: [
-        { name: 'title', weight: 0.5 },
-        { name: 'tags', weight: 0.2 },
-        { name: 'description', weight: 0.1 },
-        { name: 'notes', weight: 0.1 },
-        { name: 'summary', weight: 0.1 },
-        { name: 'context', weight: 0.1 }
-      ],
-      threshold: 0.4,
-      includeMatches: true
-    });
-
-    const results = fuse.search(query);
-
-    if (results.length === 0) {
-      console.log(chalk.dim(`No results for "${query}"`));
-      console.log(chalk.dim(`Cache last synced ${getCacheAge(cache)}`));
-      return;
-    }
-
-    const typeColors = {
-      idea: chalk.magenta,
-      task: chalk.blue,
-      note: chalk.green,
-      decision: chalk.yellow
-    };
-
-    const table = new Table({
-      head: ['Type', 'Title', 'Status', 'Date'].map(h => chalk.cyan.bold(h)),
-      style: { head: [], border: [] },
-      colWidths: [12, 50, 14, 12]
-    });
-
-    results.slice(0, 20).forEach(result => {
-      const item = result.item;
-      const colorFn = typeColors[item.type] || chalk.white;
-
-      // Highlight matching text in title
-      let displayTitle = item.title;
-      if (result.matches) {
-        const titleMatch = result.matches.find(m => m.key === 'title');
-        if (titleMatch) {
-          displayTitle = highlightMatches(item.title, titleMatch.indices);
-        }
-      }
-
-      const date = item.dueDate || item.date || (item.created ? item.created.split('T')[0] : '-');
-      const status = item.status || '-';
-
-      table.push([
-        colorFn(item.type),
-        displayTitle,
-        status,
-        date
-      ]);
-    });
-
-    console.log(chalk.dim(`\nCache synced ${getCacheAge(cache)}`));
-    console.log(table.toString());
-    console.log(chalk.dim(`\n${results.length} result${results.length !== 1 ? 's' : ''} for "${query}"`));
-  });
-
-// Highlight matched character ranges in a string
-function highlightMatches(text, indices) {
-  if (!indices || indices.length === 0) return text;
-
-  // Merge overlapping ranges
-  const sorted = [...indices].sort((a, b) => a[0] - b[0]);
-  let result = '';
-  let lastEnd = 0;
-
-  for (const [start, end] of sorted) {
-    if (start > lastEnd) {
-      result += text.slice(lastEnd, start);
-    }
-    result += chalk.bold.underline(text.slice(Math.max(start, lastEnd), end + 1));
-    lastEnd = Math.max(lastEnd, end + 1);
-  }
-  result += text.slice(lastEnd);
-  return result;
-}
-
-// Daily command - generate daily briefing from cache
-program
-  .command('daily')
-  .description('Generate a daily briefing from cached data')
-  .action(async () => {
-    const cache = loadCache();
-    if (!cache) {
-      console.log(chalk.yellow('No local cache found. Run ') + chalk.cyan('brain sync') + chalk.yellow(' first.'));
-      return;
-    }
-
-    const today = new Date().toISOString().split('T')[0];
-    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-    console.log(chalk.bold('\n🧠 Daily Briefing') + chalk.dim(` — ${today}`));
-    console.log(chalk.dim(`Cache synced ${getCacheAge(cache)}\n`));
-
-    // === Open/In-Progress Tasks ===
-    const openTasks = (cache.tasks || [])
-      .filter(t => t.status !== 'Done' && t.status !== '-')
-      .sort((a, b) => {
-        // Sort: In Progress first, then by due date
-        const statusOrder = { 'In Progress': 0, 'Todo': 1, 'Waiting': 2 };
-        const sa = statusOrder[a.status] ?? 3;
-        const sb = statusOrder[b.status] ?? 3;
-        if (sa !== sb) return sa - sb;
-        // Then by due date (nulls last)
-        if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate);
-        if (a.dueDate) return -1;
-        if (b.dueDate) return 1;
-        return 0;
-      });
-
-    console.log(chalk.cyan.bold('📋 Open Tasks'));
-    if (openTasks.length === 0) {
-      console.log(chalk.green('  ✨ No open tasks!'));
-    } else {
-      const taskTable = new Table({
-        head: ['Task', 'Status', 'Due'].map(h => chalk.cyan(h)),
-        style: { head: [], border: [] },
-        colWidths: [50, 14, 12]
-      });
-
-      openTasks.forEach(t => {
-        const isOverdue = t.dueDate && t.dueDate < today;
-        const statusColor = t.status === 'In Progress' ? chalk.yellow : chalk.dim;
-        const dueDateStr = t.dueDate || '-';
-        taskTable.push([
-          isOverdue ? chalk.red(t.title) : t.title,
-          statusColor(t.status),
-          isOverdue ? chalk.red(dueDateStr) : dueDateStr
-        ]);
-      });
-      console.log(taskTable.toString());
-    }
-    console.log();
-
-    // === Recent Ideas (last 7 days) ===
-    const recentIdeas = (cache.ideas || [])
-      .filter(i => i.created && i.created.split('T')[0] >= sevenDaysAgo)
-      .sort((a, b) => b.created.localeCompare(a.created));
-
-    console.log(chalk.magenta.bold('💡 Recent Ideas') + chalk.dim(' (last 7 days)'));
-    if (recentIdeas.length === 0) {
-      console.log(chalk.dim('  No new ideas this week'));
-    } else {
-      recentIdeas.forEach(idea => {
-        const priorityColor = idea.priority === 'High' ? chalk.red : idea.priority === 'Medium' ? chalk.yellow : chalk.dim;
-        console.log(`  ${chalk.dim('•')} ${idea.title} ${priorityColor(`[${idea.priority}]`)} ${chalk.dim(idea.created.split('T')[0])}`);
-      });
-    }
-    console.log();
-
-    // === Recent Decisions ===
-    const recentDecisions = (cache.decisions || [])
-      .filter(d => d.date && d.date >= sevenDaysAgo)
-      .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
-
-    console.log(chalk.yellow.bold('⚖️  Recent Decisions'));
-    if (recentDecisions.length === 0) {
-      console.log(chalk.dim('  No recent decisions'));
-    } else {
-      recentDecisions.forEach(d => {
-        console.log(`  ${chalk.dim('•')} ${d.title} ${chalk.dim(d.date || '')}`);
-        if (d.context) {
-          console.log(`    ${chalk.dim(d.context.substring(0, 80))}${d.context.length > 80 ? '...' : ''}`);
-        }
-      });
-    }
-    console.log();
-
-    // === Summary line ===
-    const overdueTasks = openTasks.filter(t => t.dueDate && t.dueDate < today);
-    const parts = [
-      `${chalk.bold(openTasks.length)} open task${openTasks.length !== 1 ? 's' : ''}`,
-      `${chalk.bold(recentIdeas.length)} recent idea${recentIdeas.length !== 1 ? 's' : ''}`,
-      `${chalk.bold(recentDecisions.length)} recent decision${recentDecisions.length !== 1 ? 's' : ''}`
-    ];
-    if (overdueTasks.length > 0) {
-      parts.push(chalk.red(`${chalk.bold(overdueTasks.length)} overdue`));
-    }
-    console.log(chalk.dim('—'.repeat(60)));
-    console.log(`You have ${parts.join(', ')}`);
-    console.log();
   });
 
 program

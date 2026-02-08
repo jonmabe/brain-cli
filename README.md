@@ -2,6 +2,11 @@
 
 A delightful command-line interface for interacting with the Notion Brain System.
 
+**v2.0 Features:**
+- ✨ **Offline sync** - Download your Brain data for offline access
+- 🌅 **Daily briefings** - Morning overview of tasks, ideas, and projects
+- 📡 **Auto-fallback** - Seamlessly switch to cached data when offline
+
 ## Installation
 
 ```bash
@@ -22,6 +27,25 @@ Brain CLI expects your Notion API key at:
 ```
 
 ## Usage
+
+### Sync & Daily Briefings (v2.0)
+
+**Sync your Brain data:**
+```bash
+brain sync                          # Download all data to local cache
+```
+
+**Daily briefing:**
+```bash
+brain daily                         # Show tasks (overdue, today, upcoming) + recent ideas + projects
+```
+
+**Offline mode:**
+```bash
+brain list tasks --offline          # Use cached data (works on all list commands)
+```
+
+All list commands automatically fall back to cached data when the Notion API is unavailable.
 
 ### Add Items
 
@@ -153,6 +177,22 @@ Brain CLI works with these Notion databases:
 - 📂 **Projects** - Manage larger initiatives
 
 All items created via Brain CLI are tagged with "Created by Claude" for easy filtering.
+
+## v2.0 Enhancements
+
+### Local Cache & Offline Support
+Brain CLI v2.0 introduces local caching for offline access:
+- Run `brain sync` to download all your Brain data to `~/.cache/brain-cli/sync.json`
+- All `list` commands automatically fall back to cached data when offline
+- Use `--offline` flag to force using cached data
+- Cache age is displayed when using offline mode
+
+### Daily Briefings
+The new `brain daily` command provides a morning overview:
+- **Tasks**: Overdue (red), due today (yellow), and upcoming (next 5)
+- **Ideas**: Recent ideas from the last 7 days
+- **Projects**: All active projects with goals
+- Perfect for morning standup or daily planning
 
 ## License
 
