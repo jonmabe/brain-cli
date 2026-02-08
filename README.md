@@ -83,6 +83,27 @@ brain done 2f77a821           # By ID (short form works)
 brain done "buy groceries"    # By title (fuzzy match)
 ```
 
+### Sync, Search & Daily (v2)
+
+**Sync all databases to local cache:**
+```bash
+brain sync
+# Synced 42 ideas, 15 tasks, 8 notes, 3 decisions
+```
+
+**Fuzzy search across the cache (works offline):**
+```bash
+brain search "rocket"              # Search all types
+brain search "api" --type task     # Search only tasks
+brain search "design" --type idea  # Search only ideas
+```
+
+**Daily briefing from cache:**
+```bash
+brain daily
+# Shows: open tasks, recent ideas, recent decisions, summary
+```
+
 ## Features
 
 - ✨ **Beautiful output** - Colored tables and spinners
@@ -90,13 +111,16 @@ brain done "buy groceries"    # By title (fuzzy match)
 - 🎯 **Fuzzy matching** - Find tasks by partial title
 - ⚡ **Fast** - Direct Notion API calls, no bloat
 - 🧠 **Smart defaults** - New ideas start as "New", tasks as "Todo"
+- 🔄 **Offline sync** - Cache databases locally with `brain sync`
+- 🔍 **Fuzzy search** - Search titles, tags, and content across all types
+- 📊 **Daily briefing** - Get a quick overview of your open tasks and recent activity
 
 ## Examples
 
 ```bash
 # Morning routine
-brain summary
-brain show
+brain sync           # Pull latest from Notion
+brain daily          # Get your daily briefing
 
 # Quick task add
 brain add task "Review PRs" --due today
@@ -106,6 +130,9 @@ brain done "review prs"
 
 # Check what's overdue
 brain list tasks --overdue
+
+# Search for something (offline)
+brain search "typescript"
 
 # Capture an idea
 brain add idea "AI-powered todo assistant" --priority high

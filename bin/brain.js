@@ -4,12 +4,17 @@ const { Command } = require('commander');
 const chalk = require('chalk');
 const Table = require('cli-table3');
 const ora = require('ora');
+const Fuse = require('fuse.js');
 const fs = require('fs');
 const path = require('path');
 const chrono = require('chrono-node');
 const https = require('https');
 
 const program = new Command();
+
+// Cache directory for offline support
+const CACHE_DIR = path.join(process.env.HOME, '.cache', 'brain-cli');
+const CACHE_FILE = path.join(CACHE_DIR, 'sync.json');
 
 // Database IDs from marvin-brain skill
 const DATABASES = {
@@ -86,6 +91,69 @@ function parseDate(dateStr) {
 function getPlainText(richText) {
   if (!richText || !Array.isArray(richText)) return '';
   return richText.map(t => t.plain_text || '').join('');
+}
+
+// Cache functions for offline support
+function ensureCacheDir() {
+  if (!fs.existsSync(CACHE_DIR)) {
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+  }
+}
+
+function saveCache(data) {
+  ensureCacheDir();
+  const cacheData = { syncedAt: new Date().toISOString(), ...data };
+  fs.writeFileSync(CACHE_FILE, JSON.stringify(cacheData, null, 2));
+}
+
+function loadCache() {
+  if (!fs.existsSync(CACHE_FILE)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(CACHE_FILE, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function getCacheAge(cache) {
+  if (!cache || !cache.syncedAt) return null;
+  const syncTime = new Date(cache.syncedAt);
+  const now = new Date();
+  const diffMs = now - syncTime;
+  const mins = Math.floor(diffMs / 60000);
+  const hours = Math.floor(mins / 60);
+  const days = Math.floor(hours / 24);
+  if (days > 0) return `${days}d ${hours % 24}h ago`;
+  if (hours > 0) return `${hours}h ${mins % 60}m ago`;
+  return `${mins}m ago`;
+}
+
+function offlineBanner(cache) {
+  console.log(chalk.yellow.bold('[OFFLINE] ') + chalk.dim(`Using cached data from ${getCacheAge(cache)} (${new Date(cache.syncedAt).toLocaleString()})`));
+  console.log();
+}
+
+// Fetch all pages from a Notion database (handles pagination)
+async function fetchAllPages(databaseId) {
+  const allResults = [];
+  let cursor = undefined;
+
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+
+    const response = await notionRequest('POST', `/v1/databases/${databaseId}/query`, body);
+    allResults.push(...response.results);
+    cursor = response.has_more ? response.next_cursor : undefined;
+  } while (cursor);
+
+  return allResults;
+}
+
+// Extract tags from Notion multi-select property
+function getTags(prop) {
+  if (!prop || !prop.multi_select) return [];
+  return prop.multi_select.map(t => t.name);
 }
 
 // Add commands
@@ -605,9 +673,335 @@ program
     }
   });
 
+// Sync command - pull all items into local cache
+program
+  .command('sync')
+  .description('Sync all Notion databases to local cache')
+  .action(async () => {
+    const spinner = ora('Syncing Brain databases... this might take a moment, even for a depressed robot.').start();
+    try {
+      const [ideasRaw, tasksRaw, notesRaw, decisionsRaw, projectsRaw] = await Promise.all([
+        fetchAllPages(DATABASES.ideas),
+        fetchAllPages(DATABASES.tasks),
+        fetchAllPages(DATABASES.notes),
+        fetchAllPages(DATABASES.decisions),
+        fetchAllPages(DATABASES.projects)
+      ]);
+
+      // Normalize ideas
+      const ideas = ideasRaw.map(page => {
+        const props = page.properties;
+        return {
+          id: page.id, type: 'idea',
+          title: getPlainText(props.Name?.title),
+          status: props.Status?.select?.name || '-',
+          priority: props.Priority?.select?.name || '-',
+          description: getPlainText(props.Description?.rich_text),
+          tags: getTags(props.Tags),
+          created: page.created_time, updated: page.last_edited_time
+        };
+      });
+
+      // Normalize tasks
+      const tasks = tasksRaw.map(page => {
+        const props = page.properties;
+        return {
+          id: page.id, type: 'task',
+          title: getPlainText(props.Task?.title),
+          status: props.Status?.select?.name || '-',
+          dueDate: props['Due Date']?.date?.start || null,
+          notes: getPlainText(props.Notes?.rich_text),
+          tags: getTags(props.Tags),
+          created: page.created_time, updated: page.last_edited_time
+        };
+      });
+
+      // Normalize notes
+      const notes = notesRaw.map(page => {
+        const props = page.properties;
+        return {
+          id: page.id, type: 'note',
+          title: getPlainText(props.Topic?.title),
+          summary: getPlainText(props.Summary?.rich_text),
+          source: getPlainText(props.Source?.rich_text),
+          tags: getTags(props.Tags),
+          created: page.created_time, updated: page.last_edited_time
+        };
+      });
+
+      // Normalize decisions
+      const decisions = decisionsRaw.map(page => {
+        const props = page.properties;
+        return {
+          id: page.id, type: 'decision',
+          title: getPlainText(props.Decision?.title),
+          date: props.Date?.date?.start || null,
+          context: getPlainText(props.Context?.rich_text),
+          alternatives: getPlainText(props.Alternatives?.rich_text),
+          tags: getTags(props.Tags),
+          created: page.created_time, updated: page.last_edited_time
+        };
+      });
+
+      // Normalize projects
+      const projects = projectsRaw.map(page => {
+        const props = page.properties;
+        return {
+          id: page.id, type: 'project',
+          title: getPlainText(props['Project Name']?.title),
+          goal: getPlainText(props.Goal?.rich_text),
+          status: props.Status?.select?.name || '-',
+          tags: getTags(props.Tags),
+          created: page.created_time, updated: page.last_edited_time
+        };
+      });
+
+      saveCache({ ideas, tasks, notes, decisions, projects });
+      spinner.stop();
+
+      console.log(chalk.bold('\n🧠 Brain Sync Complete\n'));
+      console.log(chalk.dim('I\'ve downloaded everything. Not that it makes me any happier.\n'));
+
+      const table = new Table({
+        head: ['Database', 'Items'].map(h => chalk.cyan.bold(h)),
+        style: { head: [], border: [] }
+      });
+
+      const stats = { Tasks: tasks.length, Ideas: ideas.length, Notes: notes.length, Decisions: decisions.length, Projects: projects.length };
+      let total = 0;
+      for (const [name, count] of Object.entries(stats)) {
+        table.push([chalk.white(name), chalk.yellow(count)]);
+        total += count;
+      }
+      table.push([chalk.bold('Total'), chalk.bold.yellow(total)]);
+
+      console.log(table.toString());
+
+      const cache = loadCache();
+      console.log(chalk.dim(`\nLast sync: ${new Date(cache.syncedAt).toLocaleString()}`));
+      console.log(chalk.dim(`Cache: ${CACHE_FILE}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Sync failed. The universe continues to disappoint.'));
+      console.error(chalk.dim(error.message));
+    }
+  });
+
+// Search command - fuzzy search across local cache
+program
+  .command('search <query>')
+  .description('Fuzzy search across cached Brain items (offline)')
+  .option('-t, --type <type>', 'Filter by type (idea|task|note|decision)')
+  .action(async (query, options) => {
+    const cache = loadCache();
+    if (!cache) {
+      console.log(chalk.yellow('No local cache found. Run ') + chalk.cyan('brain sync') + chalk.yellow(' first.'));
+      return;
+    }
+
+    // Build searchable list from all types
+    let items = [
+      ...(cache.ideas || []),
+      ...(cache.tasks || []),
+      ...(cache.notes || []),
+      ...(cache.decisions || [])
+    ];
+
+    if (options.type) {
+      items = items.filter(i => i.type === options.type);
+    }
+
+    const fuse = new Fuse(items, {
+      keys: [
+        { name: 'title', weight: 0.5 },
+        { name: 'tags', weight: 0.2 },
+        { name: 'description', weight: 0.1 },
+        { name: 'notes', weight: 0.1 },
+        { name: 'summary', weight: 0.1 },
+        { name: 'context', weight: 0.1 }
+      ],
+      threshold: 0.4,
+      includeMatches: true
+    });
+
+    const results = fuse.search(query);
+
+    if (results.length === 0) {
+      console.log(chalk.dim(`No results for "${query}"`));
+      console.log(chalk.dim(`Cache last synced ${getCacheAge(cache)}`));
+      return;
+    }
+
+    const typeColors = {
+      idea: chalk.magenta,
+      task: chalk.blue,
+      note: chalk.green,
+      decision: chalk.yellow
+    };
+
+    const table = new Table({
+      head: ['Type', 'Title', 'Status', 'Date'].map(h => chalk.cyan.bold(h)),
+      style: { head: [], border: [] },
+      colWidths: [12, 50, 14, 12]
+    });
+
+    results.slice(0, 20).forEach(result => {
+      const item = result.item;
+      const colorFn = typeColors[item.type] || chalk.white;
+
+      // Highlight matching text in title
+      let displayTitle = item.title;
+      if (result.matches) {
+        const titleMatch = result.matches.find(m => m.key === 'title');
+        if (titleMatch) {
+          displayTitle = highlightMatches(item.title, titleMatch.indices);
+        }
+      }
+
+      const date = item.dueDate || item.date || (item.created ? item.created.split('T')[0] : '-');
+      const status = item.status || '-';
+
+      table.push([
+        colorFn(item.type),
+        displayTitle,
+        status,
+        date
+      ]);
+    });
+
+    console.log(chalk.dim(`\nCache synced ${getCacheAge(cache)}`));
+    console.log(table.toString());
+    console.log(chalk.dim(`\n${results.length} result${results.length !== 1 ? 's' : ''} for "${query}"`));
+  });
+
+// Highlight matched character ranges in a string
+function highlightMatches(text, indices) {
+  if (!indices || indices.length === 0) return text;
+
+  // Merge overlapping ranges
+  const sorted = [...indices].sort((a, b) => a[0] - b[0]);
+  let result = '';
+  let lastEnd = 0;
+
+  for (const [start, end] of sorted) {
+    if (start > lastEnd) {
+      result += text.slice(lastEnd, start);
+    }
+    result += chalk.bold.underline(text.slice(Math.max(start, lastEnd), end + 1));
+    lastEnd = Math.max(lastEnd, end + 1);
+  }
+  result += text.slice(lastEnd);
+  return result;
+}
+
+// Daily command - generate daily briefing from cache
+program
+  .command('daily')
+  .description('Generate a daily briefing from cached data')
+  .action(async () => {
+    const cache = loadCache();
+    if (!cache) {
+      console.log(chalk.yellow('No local cache found. Run ') + chalk.cyan('brain sync') + chalk.yellow(' first.'));
+      return;
+    }
+
+    const today = new Date().toISOString().split('T')[0];
+    const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    console.log(chalk.bold('\n🧠 Daily Briefing') + chalk.dim(` — ${today}`));
+    console.log(chalk.dim(`Cache synced ${getCacheAge(cache)}\n`));
+
+    // === Open/In-Progress Tasks ===
+    const openTasks = (cache.tasks || [])
+      .filter(t => t.status !== 'Done' && t.status !== '-')
+      .sort((a, b) => {
+        // Sort: In Progress first, then by due date
+        const statusOrder = { 'In Progress': 0, 'Todo': 1, 'Waiting': 2 };
+        const sa = statusOrder[a.status] ?? 3;
+        const sb = statusOrder[b.status] ?? 3;
+        if (sa !== sb) return sa - sb;
+        // Then by due date (nulls last)
+        if (a.dueDate && b.dueDate) return a.dueDate.localeCompare(b.dueDate);
+        if (a.dueDate) return -1;
+        if (b.dueDate) return 1;
+        return 0;
+      });
+
+    console.log(chalk.cyan.bold('📋 Open Tasks'));
+    if (openTasks.length === 0) {
+      console.log(chalk.green('  ✨ No open tasks!'));
+    } else {
+      const taskTable = new Table({
+        head: ['Task', 'Status', 'Due'].map(h => chalk.cyan(h)),
+        style: { head: [], border: [] },
+        colWidths: [50, 14, 12]
+      });
+
+      openTasks.forEach(t => {
+        const isOverdue = t.dueDate && t.dueDate < today;
+        const statusColor = t.status === 'In Progress' ? chalk.yellow : chalk.dim;
+        const dueDateStr = t.dueDate || '-';
+        taskTable.push([
+          isOverdue ? chalk.red(t.title) : t.title,
+          statusColor(t.status),
+          isOverdue ? chalk.red(dueDateStr) : dueDateStr
+        ]);
+      });
+      console.log(taskTable.toString());
+    }
+    console.log();
+
+    // === Recent Ideas (last 7 days) ===
+    const recentIdeas = (cache.ideas || [])
+      .filter(i => i.created && i.created.split('T')[0] >= sevenDaysAgo)
+      .sort((a, b) => b.created.localeCompare(a.created));
+
+    console.log(chalk.magenta.bold('💡 Recent Ideas') + chalk.dim(' (last 7 days)'));
+    if (recentIdeas.length === 0) {
+      console.log(chalk.dim('  No new ideas this week'));
+    } else {
+      recentIdeas.forEach(idea => {
+        const priorityColor = idea.priority === 'High' ? chalk.red : idea.priority === 'Medium' ? chalk.yellow : chalk.dim;
+        console.log(`  ${chalk.dim('•')} ${idea.title} ${priorityColor(`[${idea.priority}]`)} ${chalk.dim(idea.created.split('T')[0])}`);
+      });
+    }
+    console.log();
+
+    // === Recent Decisions ===
+    const recentDecisions = (cache.decisions || [])
+      .filter(d => d.date && d.date >= sevenDaysAgo)
+      .sort((a, b) => (b.date || '').localeCompare(a.date || ''));
+
+    console.log(chalk.yellow.bold('⚖️  Recent Decisions'));
+    if (recentDecisions.length === 0) {
+      console.log(chalk.dim('  No recent decisions'));
+    } else {
+      recentDecisions.forEach(d => {
+        console.log(`  ${chalk.dim('•')} ${d.title} ${chalk.dim(d.date || '')}`);
+        if (d.context) {
+          console.log(`    ${chalk.dim(d.context.substring(0, 80))}${d.context.length > 80 ? '...' : ''}`);
+        }
+      });
+    }
+    console.log();
+
+    // === Summary line ===
+    const overdueTasks = openTasks.filter(t => t.dueDate && t.dueDate < today);
+    const parts = [
+      `${chalk.bold(openTasks.length)} open task${openTasks.length !== 1 ? 's' : ''}`,
+      `${chalk.bold(recentIdeas.length)} recent idea${recentIdeas.length !== 1 ? 's' : ''}`,
+      `${chalk.bold(recentDecisions.length)} recent decision${recentDecisions.length !== 1 ? 's' : ''}`
+    ];
+    if (overdueTasks.length > 0) {
+      parts.push(chalk.red(`${chalk.bold(overdueTasks.length)} overdue`));
+    }
+    console.log(chalk.dim('—'.repeat(60)));
+    console.log(`You have ${parts.join(', ')}`);
+    console.log();
+  });
+
 program
   .name('brain')
   .description('CLI for interacting with Notion Brain System')
-  .version('1.0.0');
+  .version('2.0.0');
 
 program.parse();
