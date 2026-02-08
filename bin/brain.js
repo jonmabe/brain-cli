@@ -8,6 +8,8 @@ const fs = require('fs');
 const path = require('path');
 const chrono = require('chrono-node');
 const https = require('https');
+const crypto = require('crypto');
+const { markdownToBlocks } = require('@tryfabric/martian');
 
 const program = new Command();
 
@@ -923,6 +925,510 @@ program
       }
     } catch (error) {
       spinner.fail(chalk.red('Failed to generate summary'));
+      console.error(chalk.dim(error.message));
+    }
+  });
+
+// Notes sync paths
+const NOTES_DIR = path.join(CACHE_DIR, 'notes');
+const NOTES_SYNC_STATE = path.join(CACHE_DIR, '.notes-sync-state.json');
+const NOTES_CONFLICTS = path.join(CACHE_DIR, 'sync-conflicts.md');
+
+// Notes sync helpers
+function ensureNotesDir() {
+  if (!fs.existsSync(NOTES_DIR)) {
+    fs.mkdirSync(NOTES_DIR, { recursive: true });
+  }
+}
+
+function noteContentHash(content) {
+  return crypto.createHash('md5').update(content).digest('hex').substring(0, 12);
+}
+
+function slugify(title) {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-|-$/g, '')
+    .substring(0, 60);
+}
+
+function loadNotesSyncState() {
+  if (fs.existsSync(NOTES_SYNC_STATE)) {
+    try {
+      return JSON.parse(fs.readFileSync(NOTES_SYNC_STATE, 'utf8'));
+    } catch (e) {
+      return { notes: {}, lastSync: null };
+    }
+  }
+  return { notes: {}, lastSync: null };
+}
+
+function saveNotesSyncState(state, dryRun) {
+  if (!dryRun) {
+    state.lastSync = new Date().toISOString();
+    ensureCacheDir();
+    fs.writeFileSync(NOTES_SYNC_STATE, JSON.stringify(state, null, 2));
+  }
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function richTextToMd(richText) {
+  if (!richText || !Array.isArray(richText)) return '';
+  return richText.map(t => {
+    let text = t.plain_text || '';
+    if (t.annotations?.bold) text = `**${text}**`;
+    if (t.annotations?.italic) text = `*${text}*`;
+    if (t.annotations?.code) text = `\`${text}\``;
+    if (t.annotations?.strikethrough) text = `~~${text}~~`;
+    if (t.href) text = `[${text}](${t.href})`;
+    return text;
+  }).join('');
+}
+
+function blocksToMarkdown(blocks) {
+  let md = '';
+
+  for (const block of blocks) {
+    const type = block.type;
+    const content = block[type];
+
+    switch (type) {
+      case 'paragraph':
+        md += `${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      case 'heading_1':
+        md += `# ${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      case 'heading_2':
+        md += `## ${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      case 'heading_3':
+        md += `### ${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      case 'bulleted_list_item':
+        md += `- ${richTextToMd(content?.rich_text)}\n`;
+        break;
+      case 'numbered_list_item':
+        md += `1. ${richTextToMd(content?.rich_text)}\n`;
+        break;
+      case 'to_do':
+        const check = content?.checked ? 'x' : ' ';
+        md += `- [${check}] ${richTextToMd(content?.rich_text)}\n`;
+        break;
+      case 'toggle':
+        md += `<details>\n<summary>${richTextToMd(content?.rich_text)}</summary>\n\n</details>\n\n`;
+        break;
+      case 'code':
+        const lang = content?.language || '';
+        md += `\`\`\`${lang}\n${richTextToMd(content?.rich_text)}\n\`\`\`\n\n`;
+        break;
+      case 'quote':
+        md += `> ${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      case 'divider':
+        md += `---\n\n`;
+        break;
+      case 'callout':
+        const emoji = content?.icon?.emoji || '';
+        md += `> ${emoji} ${richTextToMd(content?.rich_text)}\n\n`;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return md.trim();
+}
+
+function parseNoteMd(filePath) {
+  const content = fs.readFileSync(filePath, 'utf8');
+  const match = content.match(/^---\n([\s\S]*?)\n---\n([\s\S]*)$/);
+
+  if (!match) {
+    return { frontmatter: {}, body: content };
+  }
+
+  const frontmatter = {};
+  match[1].split('\n').forEach(line => {
+    const [key, ...rest] = line.split(':');
+    if (key && rest.length) {
+      frontmatter[key.trim()] = rest.join(':').trim();
+    }
+  });
+
+  return { frontmatter, body: match[2].trim() };
+}
+
+function writeNoteMd(filePath, frontmatter, body) {
+  const yaml = Object.entries(frontmatter)
+    .map(([k, v]) => `${k}: ${v}`)
+    .join('\n');
+
+  const content = `---\n${yaml}\n---\n\n${body}\n`;
+  fs.writeFileSync(filePath, content);
+  return content;
+}
+
+async function fetchAllPageBlocks(pageId) {
+  const blocks = [];
+  let cursor = null;
+
+  do {
+    const endpoint = `/v1/blocks/${pageId}/children${cursor ? `?start_cursor=${cursor}` : ''}`;
+    const response = await notionRequest('GET', endpoint);
+    blocks.push(...response.results);
+    cursor = response.has_more ? response.next_cursor : null;
+    if (cursor) await sleep(100);
+  } while (cursor);
+
+  return blocks;
+}
+
+async function deleteAllBlocks(pageId) {
+  const blocks = await fetchAllPageBlocks(pageId);
+  let deleted = 0;
+  for (const block of blocks) {
+    await notionRequest('DELETE', `/v1/blocks/${block.id}`);
+    deleted++;
+    if (deleted % 5 === 0) await sleep(150);
+  }
+  return deleted;
+}
+
+async function appendBlocks(pageId, blocks) {
+  const CHUNK_SIZE = 100;
+  let appended = 0;
+  for (let i = 0; i < blocks.length; i += CHUNK_SIZE) {
+    const chunk = blocks.slice(i, i + CHUNK_SIZE);
+    await notionRequest('PATCH', `/v1/blocks/${pageId}/children`, {
+      children: chunk
+    });
+    appended += chunk.length;
+    if (i + CHUNK_SIZE < blocks.length) await sleep(200);
+  }
+  return appended;
+}
+
+// Notes subcommand group
+const notes = program.command('notes').description('Bidirectional notes sync with individual MD files');
+
+notes.command('pull')
+  .description('Pull notes from Notion to local MD files')
+  .option('--dry-run', 'Show what would happen without making changes')
+  .action(async (options) => {
+    const dryRun = options.dryRun;
+    const spinner = ora('Pulling notes from Notion...').start();
+    try {
+      ensureNotesDir();
+      let state = loadNotesSyncState();
+      let cursor = null;
+      let pulled = 0;
+      let skipped = 0;
+
+      do {
+        const body = { page_size: 100 };
+        if (cursor) body.start_cursor = cursor;
+        const response = await notionRequest('POST', `/v1/databases/${DATABASES.notes}/query`, body);
+
+        for (const page of response.results) {
+          const id = page.id;
+          const title = getPlainText(page.properties?.Topic?.title) || 'Untitled';
+          const type = page.properties?.Type?.select?.name || '';
+          const status = page.properties?.Status?.select?.name || '';
+          const notionUpdated = page.last_edited_time;
+
+          const slug = slugify(title);
+          const filePath = path.join(NOTES_DIR, `${slug}.md`);
+
+          const existing = state.notes[id];
+          const localExists = fs.existsSync(filePath);
+
+          if (existing && localExists && existing.notionUpdated === notionUpdated) {
+            skipped++;
+            continue;
+          }
+
+          spinner.text = `Pulling: ${title}`;
+          const blocks = await fetchAllPageBlocks(id);
+          const mdBody = blocksToMarkdown(blocks);
+
+          const frontmatter = {
+            id,
+            title,
+            type,
+            status,
+            notionUrl: `https://notion.so/${id.replace(/-/g, '')}`,
+            lastSyncedAt: new Date().toISOString(),
+            contentHash: noteContentHash(mdBody)
+          };
+
+          if (!dryRun) {
+            writeNoteMd(filePath, frontmatter, mdBody);
+          }
+
+          state.notes[id] = {
+            slug,
+            title,
+            notionUpdated,
+            localHash: frontmatter.contentHash,
+            notionHash: frontmatter.contentHash
+          };
+
+          pulled++;
+          await sleep(200);
+        }
+
+        cursor = response.has_more ? response.next_cursor : null;
+      } while (cursor);
+
+      saveNotesSyncState(state, dryRun);
+      spinner.succeed(chalk.green(`✓ Pull complete! ${dryRun ? '[DRY RUN] ' : ''}Pulled: ${pulled}, Skipped: ${skipped}`));
+      console.log(chalk.dim(`Notes dir: ${NOTES_DIR}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Pull failed'));
+      console.error(chalk.dim(error.message));
+      process.exit(1);
+    }
+  });
+
+notes.command('push')
+  .description('Push local MD notes to Notion')
+  .option('--dry-run', 'Show what would happen without making changes')
+  .action(async (options) => {
+    const dryRun = options.dryRun;
+    const spinner = ora('Pushing notes to Notion...').start();
+    try {
+      ensureNotesDir();
+      let state = loadNotesSyncState();
+
+      const files = fs.readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
+      let pushed = 0;
+      let created = 0;
+      let skipped = 0;
+      let conflicts = [];
+
+      for (const file of files) {
+        const filePath = path.join(NOTES_DIR, file);
+        const { frontmatter, body } = parseNoteMd(filePath);
+        const currentHash = noteContentHash(body);
+
+        // New local note (no Notion ID)
+        if (!frontmatter.id) {
+          spinner.text = `Creating: ${frontmatter.title || file}`;
+
+          if (dryRun) {
+            console.log(chalk.dim(`  [dry-run] Would create "${frontmatter.title || file}"`));
+            created++;
+            continue;
+          }
+
+          const blocks = markdownToBlocks(body);
+          const properties = {
+            'Topic': { title: [{ text: { content: frontmatter.title || file.replace('.md', '') } }] },
+            'Created by Claude': { checkbox: true }
+          };
+          if (frontmatter.type) {
+            properties['Type'] = { select: { name: frontmatter.type } };
+          }
+          if (frontmatter.status) {
+            properties['Status'] = { select: { name: frontmatter.status } };
+          }
+
+          const firstBatch = blocks.slice(0, 100);
+          const pageData = {
+            parent: { database_id: DATABASES.notes },
+            properties,
+            children: firstBatch
+          };
+
+          const page = await notionRequest('POST', '/v1/pages', pageData);
+          if (blocks.length > 100) {
+            await appendBlocks(page.id, blocks.slice(100));
+          }
+
+          frontmatter.id = page.id;
+          frontmatter.notionUrl = `https://notion.so/${page.id.replace(/-/g, '')}`;
+          frontmatter.lastSyncedAt = new Date().toISOString();
+          frontmatter.contentHash = currentHash;
+          writeNoteMd(filePath, frontmatter, body);
+
+          state.notes[page.id] = {
+            slug: file.replace('.md', ''),
+            title: frontmatter.title || file,
+            notionUpdated: new Date().toISOString(),
+            localHash: currentHash,
+            notionHash: currentHash
+          };
+
+          created++;
+          await sleep(300);
+          continue;
+        }
+
+        // Existing note: check for changes
+        const existing = state.notes[frontmatter.id];
+
+        if (!existing) {
+          skipped++;
+          continue;
+        }
+
+        if (currentHash === existing.localHash) {
+          skipped++;
+          continue;
+        }
+
+        // Local changed — check for conflict
+        if (existing.notionHash !== existing.localHash) {
+          conflicts.push({
+            file,
+            frontmatter,
+            localHash: currentHash,
+            lastSyncLocalHash: existing.localHash,
+            notionHash: existing.notionHash
+          });
+          continue;
+        }
+
+        // Only local changed — safe to push
+        spinner.text = `Pushing: ${file}`;
+
+        if (dryRun) {
+          console.log(chalk.dim(`  [dry-run] Would push ${file}`));
+          pushed++;
+          continue;
+        }
+
+        const blocks = markdownToBlocks(body);
+        await deleteAllBlocks(frontmatter.id);
+        await appendBlocks(frontmatter.id, blocks);
+
+        // Update page properties
+        const properties = {};
+        if (frontmatter.title) {
+          properties['Topic'] = { title: [{ text: { content: frontmatter.title } }] };
+        }
+        if (frontmatter.type) {
+          properties['Type'] = { select: { name: frontmatter.type } };
+        }
+        if (frontmatter.status) {
+          properties['Status'] = { select: { name: frontmatter.status } };
+        }
+        if (Object.keys(properties).length > 0) {
+          await notionRequest('PATCH', `/v1/pages/${frontmatter.id}`, { properties });
+        }
+
+        frontmatter.lastSyncedAt = new Date().toISOString();
+        frontmatter.contentHash = currentHash;
+        writeNoteMd(filePath, frontmatter, body);
+
+        existing.localHash = currentHash;
+        existing.notionHash = currentHash;
+        existing.notionUpdated = new Date().toISOString();
+
+        pushed++;
+        await sleep(300);
+      }
+
+      // Write conflicts file
+      if (conflicts.length > 0) {
+        let conflictMd = `# Sync Conflicts - ${new Date().toISOString()}\n\n`;
+        conflictMd += `Resolve by editing the local file, then re-run sync.\n\n`;
+        for (const c of conflicts) {
+          conflictMd += `## ${c.file}\n`;
+          conflictMd += `- Current local hash: ${c.localHash}\n`;
+          conflictMd += `- Last synced local hash: ${c.lastSyncLocalHash}\n`;
+          conflictMd += `- Last synced Notion hash: ${c.notionHash}\n`;
+          conflictMd += `- Page: ${c.frontmatter.notionUrl || c.frontmatter.id}\n\n`;
+        }
+        if (!dryRun) {
+          fs.writeFileSync(NOTES_CONFLICTS, conflictMd);
+        }
+      }
+
+      saveNotesSyncState(state, dryRun);
+      spinner.succeed(chalk.green(`✓ Push complete! ${dryRun ? '[DRY RUN] ' : ''}Pushed: ${pushed}, Created: ${created}, Skipped: ${skipped}, Conflicts: ${conflicts.length}`));
+      if (conflicts.length > 0) {
+        console.log(chalk.yellow(`  ⚠️  ${conflicts.length} conflicts written to ${NOTES_CONFLICTS}`));
+      }
+    } catch (error) {
+      spinner.fail(chalk.red('Push failed'));
+      console.error(chalk.dim(error.message));
+      process.exit(1);
+    }
+  });
+
+notes.command('sync')
+  .description('Pull then push notes (bidirectional sync)')
+  .option('--dry-run', 'Show what would happen without making changes')
+  .action(async (options) => {
+    const dryRunFlag = options.dryRun ? ' --dry-run' : '';
+    console.log(chalk.bold('\n🔄 Notes Sync\n'));
+
+    // Run pull
+    await notes.commands.find(c => c.name() === 'pull').parseAsync(['pull', ...(options.dryRun ? ['--dry-run'] : [])], { from: 'user' });
+
+    // Run push
+    await notes.commands.find(c => c.name() === 'push').parseAsync(['push', ...(options.dryRun ? ['--dry-run'] : [])], { from: 'user' });
+
+    console.log(chalk.green('\n✓ Notes sync complete!'));
+  });
+
+notes.command('list')
+  .description('List synced notes from local cache')
+  .option('--offline', 'Use only local cached data')
+  .action(async (options) => {
+    try {
+      ensureNotesDir();
+
+      const files = fs.readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
+
+      if (files.length === 0) {
+        console.log(chalk.dim('No synced notes found. Run `brain notes pull` first.'));
+        return;
+      }
+
+      const table = new Table({
+        head: ['File', 'Title', 'Type', 'Status'].map(h => chalk.cyan.bold(h)),
+        style: { head: [], border: [] }
+      });
+
+      for (const file of files) {
+        const filePath = path.join(NOTES_DIR, file);
+        const { frontmatter } = parseNoteMd(filePath);
+        table.push([
+          chalk.yellow(file),
+          frontmatter.title || '-',
+          frontmatter.type || '-',
+          frontmatter.status || '-'
+        ]);
+      }
+
+      console.log(table.toString());
+      console.log(chalk.dim(`\nTotal: ${files.length} notes`));
+
+      // Show cache age from sync state
+      if (fs.existsSync(NOTES_SYNC_STATE)) {
+        const state = loadNotesSyncState();
+        if (state.lastSync) {
+          const ageMs = Date.now() - new Date(state.lastSync).getTime();
+          const ageMin = Math.floor(ageMs / 60000);
+          const ageHours = Math.floor(ageMin / 60);
+          const ageDays = Math.floor(ageHours / 24);
+          let age;
+          if (ageDays > 0) age = `${ageDays}d ago`;
+          else if (ageHours > 0) age = `${ageHours}h ago`;
+          else age = `${ageMin}m ago`;
+          console.log(chalk.dim(`Last sync: ${age}`));
+        }
+      }
+      console.log(chalk.dim(`Notes dir: ${NOTES_DIR}`));
+    } catch (error) {
+      console.error(chalk.red('Failed to list notes'));
       console.error(chalk.dim(error.message));
     }
   });
