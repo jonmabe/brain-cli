@@ -1381,6 +1381,7 @@ notes.command('sync')
 notes.command('list')
   .description('List synced notes from local cache')
   .option('--offline', 'Use only local cached data')
+  .option('--format <format>', 'Output format: table or json', 'table')
   .action(async (options) => {
     try {
       ensureNotesDir();
@@ -1388,7 +1389,29 @@ notes.command('list')
       const files = fs.readdirSync(NOTES_DIR).filter(f => f.endsWith('.md'));
 
       if (files.length === 0) {
-        console.log(chalk.dim('No synced notes found. Run `brain notes pull` first.'));
+        if (options.format === 'json') {
+          console.log('[]');
+        } else {
+          console.log(chalk.dim('No synced notes found. Run `brain notes pull` first.'));
+        }
+        return;
+      }
+
+      const notes = [];
+      for (const file of files) {
+        const filePath = path.join(NOTES_DIR, file);
+        const { frontmatter } = parseNoteMd(filePath);
+        notes.push({
+          file,
+          title: frontmatter.title || null,
+          type: frontmatter.type || null,
+          status: frontmatter.status || null,
+          ...frontmatter
+        });
+      }
+
+      if (options.format === 'json') {
+        console.log(JSON.stringify(notes, null, 2));
         return;
       }
 
@@ -1397,14 +1420,12 @@ notes.command('list')
         style: { head: [], border: [] }
       });
 
-      for (const file of files) {
-        const filePath = path.join(NOTES_DIR, file);
-        const { frontmatter } = parseNoteMd(filePath);
+      for (const note of notes) {
         table.push([
-          chalk.yellow(file),
-          frontmatter.title || '-',
-          frontmatter.type || '-',
-          frontmatter.status || '-'
+          chalk.yellow(note.file),
+          note.title || '-',
+          note.type || '-',
+          note.status || '-'
         ]);
       }
 
