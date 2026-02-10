@@ -10,6 +10,7 @@ const chrono = require('chrono-node');
 const https = require('https');
 const crypto = require('crypto');
 const { markdownToBlocks } = require('@tryfabric/martian');
+const reminders = require('../commands/reminders');
 
 const program = new Command();
 
@@ -1454,9 +1455,12 @@ notes.command('list')
     }
   });
 
+// Register reminder commands
+reminders.register(program, { notionRequest, getPlainText, DATABASES, parseDate, loadCache, getCacheAge });
+
 program
   .name('brain')
   .description('CLI for interacting with Notion Brain System')
-  .version('2.0.0');
+  .version('3.0.0');
 
 program.parse();
