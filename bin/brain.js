@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const chrono = require('chrono-node');
 const https = require('https');
+const http = require('http');
 const crypto = require('crypto');
 const { markdownToBlocks } = require('@tryfabric/martian');
 const reminders = require('../commands/reminders');
@@ -1452,6 +1453,109 @@ notes.command('list')
     } catch (error) {
       console.error(chalk.red('Failed to list notes'));
       console.error(chalk.dim(error.message));
+    }
+  });
+
+// Push dashboard command
+program
+  .command('push-dashboard')
+  .description('Push brain snapshot to Marvin dashboard')
+  .option('--url <url>', 'Dashboard API URL', 'http://marvin-dashboard.192.168.1.197.sslip.io/api/brain')
+  .option('--token <token>', 'Webhook token', 'marvin-update-secret')
+  .action(async (options) => {
+    const spinner = ora('Fetching brain data...').start();
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+      const sevenDaysFromNow = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+      const [tasksRes, ideasRes, decisionsRes] = await Promise.all([
+        notionRequest('POST', `/v1/databases/${DATABASES.tasks}/query`, {
+          filter: { property: 'Status', select: { does_not_equal: 'Done' } },
+          sorts: [
+            { property: 'Due Date', direction: 'ascending' }
+          ]
+        }),
+        notionRequest('POST', `/v1/databases/${DATABASES.ideas}/query`, {
+          filter: { timestamp: 'created_time', created_time: { on_or_after: sevenDaysAgo } },
+          sorts: [{ timestamp: 'created_time', direction: 'descending' }]
+        }),
+        notionRequest('POST', `/v1/databases/${DATABASES.decisions}/query`, {
+          filter: {
+            and: [
+              { property: 'Date', date: { is_not_empty: true } },
+              { property: 'Date', date: { on_or_before: sevenDaysFromNow } },
+              { property: 'Outcome', rich_text: { is_empty: true } }
+            ]
+          },
+          sorts: [{ property: 'Date', direction: 'ascending' }]
+        })
+      ]);
+
+      const tasks = tasksRes.results.map(p => ({
+        id: p.id.split('-')[0],
+        title: getPlainText(p.properties.Task?.title),
+        status: p.properties.Status?.select?.name || '-',
+        due: p.properties['Due Date']?.date?.start || null
+      }));
+
+      const ideas = ideasRes.results.map(p => ({
+        id: p.id.split('-')[0],
+        title: getPlainText(p.properties.Name?.title),
+        date: p.created_time.split('T')[0],
+        priority: p.properties.Priority?.select?.name || 'Medium'
+      }));
+
+      const decisions = decisionsRes.results.map(p => ({
+        id: p.id.split('-')[0],
+        title: getPlainText(p.properties.Decision?.title),
+        due: p.properties.Date?.date?.start || null
+      }));
+
+      const payload = {
+        tasks,
+        ideas,
+        decisions,
+        snapshot: new Date().toISOString()
+      };
+
+      spinner.text = 'Pushing to dashboard...';
+
+      const url = new URL(options.url);
+      const transport = url.protocol === 'https:' ? https : http;
+
+      await new Promise((resolve, reject) => {
+        const req = transport.request({
+          hostname: url.hostname,
+          port: url.port || (url.protocol === 'https:' ? 443 : 80),
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Webhook-Token': options.token
+          }
+        }, (res) => {
+          let body = '';
+          res.on('data', (chunk) => body += chunk);
+          res.on('end', () => {
+            if (res.statusCode >= 200 && res.statusCode < 300) {
+              resolve(JSON.parse(body));
+            } else {
+              reject(new Error(`Dashboard API error: ${res.statusCode} - ${body}`));
+            }
+          });
+        });
+        req.on('error', reject);
+        req.write(JSON.stringify(payload));
+        req.end();
+      });
+
+      spinner.succeed(chalk.green('✓ Pushed brain snapshot to dashboard'));
+      console.log(chalk.dim(`  Tasks: ${tasks.length}, Ideas: ${ideas.length}, Decisions: ${decisions.length}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to push to dashboard'));
+      console.error(chalk.dim(error.message));
+      process.exit(1);
     }
   });
 
