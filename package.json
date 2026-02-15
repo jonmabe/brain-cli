@@ -1,6 +1,6 @@
 {
   "name": "brain-cli",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "CLI for interacting with Notion Brain System",
   "main": "index.js",
   "bin": {

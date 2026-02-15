@@ -449,6 +449,133 @@ add.command('project <name>')
     }
   });
 
+// Quick Capture commands
+const capture = program.command('capture').description('Quick capture: voice memos, images, thoughts');
+
+capture.command('voice <text>')
+  .description('Capture a voice memo transcription as a note')
+  .option('-t, --title <title>', 'Override auto-generated title')
+  .action(async (text, options) => {
+    const spinner = ora('Capturing voice memo...').start();
+    try {
+      const now = new Date();
+      const timestamp = now.toLocaleString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric',
+        hour: 'numeric', minute: '2-digit', hour12: true
+      });
+      const title = options.title || `Voice Memo – ${timestamp}`;
+
+      const data = {
+        parent: { database_id: DATABASES.notes },
+        properties: {
+          'Topic': { title: [{ text: { content: title } }] },
+          'Type': { select: { name: 'Voice Memo' } },
+          'Summary': { rich_text: [{ text: { content: text.substring(0, 2000) } }] },
+          'Created by Claude': { checkbox: true }
+        },
+        children: [
+          {
+            object: 'block',
+            type: 'paragraph',
+            paragraph: { rich_text: [{ text: { content: text } }] }
+          }
+        ]
+      };
+
+      await notionRequest('POST', '/v1/pages', data);
+      spinner.succeed(chalk.green(`✓ Captured voice memo: ${title}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to capture voice memo'));
+      console.error(chalk.dim(error.message));
+    }
+  });
+
+capture.command('image <path> [description]')
+  .description('Capture an image reference with optional description')
+  .option('-t, --title <title>', 'Override auto-generated title')
+  .action(async (imagePath, description, options) => {
+    const spinner = ora('Capturing image note...').start();
+    try {
+      const now = new Date();
+      const timestamp = now.toLocaleString('en-US', {
+        month: 'short', day: 'numeric', year: 'numeric',
+        hour: 'numeric', minute: '2-digit', hour12: true
+      });
+      const basename = path.basename(imagePath);
+      const title = options.title || `Image Note – ${basename} – ${timestamp}`;
+
+      const isUrl = /^https?:\/\//.test(imagePath);
+      const resolvedPath = isUrl ? imagePath : path.resolve(imagePath);
+
+      const summaryParts = [`Image: ${resolvedPath}`];
+      if (description) summaryParts.push(description);
+
+      const children = [];
+
+      if (isUrl) {
+        children.push({
+          object: 'block',
+          type: 'image',
+          image: { type: 'external', external: { url: imagePath } }
+        });
+      } else {
+        children.push({
+          object: 'block',
+          type: 'paragraph',
+          paragraph: { rich_text: [{ text: { content: `📎 File: ${resolvedPath}` } }] }
+        });
+      }
+
+      if (description) {
+        children.push({
+          object: 'block',
+          type: 'paragraph',
+          paragraph: { rich_text: [{ text: { content: description } }] }
+        });
+      }
+
+      const data = {
+        parent: { database_id: DATABASES.notes },
+        properties: {
+          'Topic': { title: [{ text: { content: title } }] },
+          'Type': { select: { name: 'Image Note' } },
+          'Summary': { rich_text: [{ text: { content: summaryParts.join(' — ').substring(0, 2000) } }] },
+          'Created by Claude': { checkbox: true }
+        },
+        children
+      };
+
+      await notionRequest('POST', '/v1/pages', data);
+      spinner.succeed(chalk.green(`✓ Captured image note: ${title}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to capture image note'));
+      console.error(chalk.dim(error.message));
+    }
+  });
+
+capture.command('quick <text>')
+  .description('Quick thought capture — minimal friction idea')
+  .action(async (text) => {
+    const spinner = ora('Capturing thought...').start();
+    try {
+      const data = {
+        parent: { database_id: DATABASES.ideas },
+        properties: {
+          'Name': { title: [{ text: { content: text } }] },
+          'Status': { select: { name: 'New' } },
+          'Priority': { select: { name: 'Medium' } },
+          'Created by Claude': { checkbox: true }
+        }
+      };
+
+      await notionRequest('POST', '/v1/pages', data);
+      spinner.succeed(chalk.green(`✓ Captured: ${text}`));
+    } catch (error) {
+      spinner.fail(chalk.red('Failed to capture thought'));
+      console.error(chalk.dim(error.message));
+    }
+  });
+
 // List commands with offline support
 const list = program.command('list').description('List items from Brain');
 
@@ -1565,6 +1692,6 @@ reminders.register(program, { notionRequest, getPlainText, DATABASES, parseDate,
 program
   .name('brain')
   .description('CLI for interacting with Notion Brain System')
-  .version('3.0.0');
+  .version('3.1.0');
 
 program.parse();
